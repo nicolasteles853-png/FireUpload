@@ -1,83 +1,97 @@
-const express = require("express");
-const multer = require("multer");
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const mime = require("mime-types");
-const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
-const app = express();
 const PORT = process.env.PORT || 3000;
+const API_KEY = "gcwIwwg7l6tVFnhVePXYTWY2TkRwGRPlk72p2H485b22c7c1";
+const UPLOAD_DIR = path.join(__dirname, "uploads");
 
-// Configurações
-const MAX_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
-const BLOCKED_EXT = ["php","phtml","phar","sh","exe","bat","js","cgi","pl"];
-const API_KEY = "33c0c284315e538a5c166a8d0ccda4ccaeb360a14d4fc11094535e091e5e0664";
+// cria pasta uploads se não existir
+if (!fs.existsSync(UPLOAD_DIR)) {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
 
-// Cria pasta uploads se não existir
-const uploadBase = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadBase)) fs.mkdirSync(uploadBase, { recursive: true });
-
-// Configuração do multer (armazenamento dinâmico por UID)
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uid = uuidv4();
-    const dir = path.join(uploadBase, uid);
-    fs.mkdirSync(dir, { recursive: true });
-    req.uploadDir = dir;  // salva o diretório pra depois
-    req.uid = uid;        // salva UID
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    let originalName = file.originalname.replace(/[^A-Za-z0-9._-]/g, "_");
-    const ext = path.extname(originalName).toLowerCase().replace(".", "");
-    if (BLOCKED_EXT.includes(ext)) {
-      return cb(new Error("Tipo de arquivo não permitido"));
-    }
-    cb(null, originalName);
-  }
-});
-
-const upload = multer({ storage, limits: { fileSize: MAX_UPLOAD_SIZE } });
-
-// Middleware para checar API Key
-app.use((req, res, next) => {
-  if (req.method !== "POST") return res.status(400).json({ status: "error", message: "Método inválido" });
-  const key = req.headers["x-api-key"];
-  if (!key || key !== API_KEY) return res.status(403).json({ status: "error", message: "Chave de API inválida" });
-  next();
-});
-
-// Endpoint de upload
-app.post("/upload", upload.single("file"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ status: "error", message: "Nenhum arquivo enviado" });
-
-    const filePath = path.join(req.uploadDir, req.file.filename);
-    const stats = fs.statSync(filePath);
-    const mimeType = mime.lookup(filePath) || "application/octet-stream";
-
-    const protocol = req.protocol;
-    const host = req.get("host");
-    const url = `${protocol}://${host}/uploads/${req.uid}/${req.file.filename}`;
-
-    res.json({
-      status: "OK",
-      nome: req.file.originalname,
-      "file-type": path.extname(req.file.originalname).slice(1),
-      mime: mimeType,
-      size_bytes: stats.size,
-      size_kb: +(stats.size / 1024).toFixed(2),
-      size_mb: +(stats.size / 1024 / 1024).toFixed(2),
-      url: url,
-      uid: req.uid
+function sendJSON(res, status, data) {
+    res.writeHead(status, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
     });
-  } catch (err) {
-    res.status(500).json({ status: "error", message: err.message });
-  }
+    res.end(JSON.stringify(data));
+}
+
+http.createServer((req, res) => {
+
+    if (req.method !== "POST") {
+        return sendJSON(res, 405, { status: "ERROR", message: "Método não permitido" });
+    }
+
+    // API KEY
+    const apiKey = req.headers["x-api-key"];
+    if (apiKey !== API_KEY) {
+        return sendJSON(res, 401, { status: "ERROR", message: "API KEY inválida" });
+    }
+
+    const boundaryMatch = req.headers["content-type"]?.match(/boundary=(.+)$/);
+    if (!boundaryMatch) {
+        return sendJSON(res, 400, { status: "ERROR", message: "Boundary não encontrado" });
+    }
+
+    const boundary = Buffer.from("--" + boundaryMatch[1]);
+    let buffer = Buffer.alloc(0);
+
+    req.on("data", chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+    });
+
+    req.on("end", () => {
+        const parts = buffer.split(boundary);
+
+        for (const part of parts) {
+            if (part.includes("Content-Disposition")) {
+                const match = part.toString().match(/filename="(.+?)"/);
+                if (!match) continue;
+
+                const originalName = match[1];
+                const ext = path.extname(originalName);
+                const randomName = crypto.randomBytes(16).toString("hex") + ext;
+
+                const start = part.indexOf("\r\n\r\n") + 4;
+                const end = part.lastIndexOf("\r\n");
+
+                const fileBuffer = part.slice(start, end);
+                const savePath = path.join(UPLOAD_DIR, randomName);
+
+                fs.writeFileSync(savePath, fileBuffer);
+
+                const baseUrl = `https://${req.headers.host}`;
+                const fileUrl = `${baseUrl}/uploads/${randomName}`;
+
+                return sendJSON(res, 200, {
+                    status: "OK",
+                    url: fileUrl,
+                    name: originalName,
+                    type: ext.replace(".", "")
+                });
+            }
+        }
+
+        sendJSON(res, 400, { status: "ERROR", message: "Arquivo não encontrado" });
+    });
+
+}).listen(PORT, () => {
+    console.log("🔥 FireUpload rodando na porta", PORT);
 });
 
-// Rota teste
-app.get("/", (req, res) => res.send("API FireUpload rodando!"));
-
-// Start server
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+// polyfill Buffer.split
+Buffer.prototype.split = function (sep) {
+    let arr = [];
+    let start = 0;
+    let index;
+    while ((index = this.indexOf(sep, start)) !== -1) {
+        arr.push(this.slice(start, index));
+        start = index + sep.length;
+    }
+    arr.push(this.slice(start));
+    return arr;
+};
